@@ -151,7 +151,13 @@ async function metaFetch(url, token, attempt = 1) {
       await sleep(backoff);
       return metaFetch(url, token, attempt + 1);
     }
-    throw new Error(`Meta API error [${res.status}]: ${JSON.stringify(err)}`);
+    const message = err && err.message ? err.message : res.statusText || "Unknown error";
+    const metaError = new Error(`Meta API error [${res.status}]: ${message}`);
+    metaError.status = res.status;
+    metaError.meta = err;
+    metaError.response = res.data;
+    metaError.requestUrl = url;
+    throw metaError;
   } catch (error) {
     if (attempt <= 3) {
       await sleep(500 * attempt);
@@ -159,6 +165,33 @@ async function metaFetch(url, token, attempt = 1) {
     }
     throw error;
   }
+}
+
+function extractInvalidInsightFields(error) {
+  const seen = new Set();
+  const messages = [];
+  if (error && typeof error.meta?.message === "string") messages.push(error.meta.message);
+  if (error && typeof error.message === "string") messages.push(error.message);
+  if (error && typeof error.response?.error?.message === "string") messages.push(error.response.error.message);
+
+  messages.forEach((raw) => {
+    if (!raw) return;
+    const normalized = raw.replace(/^Meta API error \[\d+\]:\s*/, "");
+    const listMatch = normalized.match(/(?:\(#\d+\)\s*)?([^:]+?)\s+are not valid for fields param/i);
+    if (listMatch && listMatch[1]) {
+      listMatch[1]
+        .split(",")
+        .map((segment) => segment.trim().replace(/^['"]|['"]$/g, ""))
+        .filter((segment) => /^[A-Za-z0-9_]+$/.test(segment))
+        .forEach((segment) => seen.add(segment));
+    }
+    const singleMatch = normalized.match(/['"]?([A-Za-z0-9_]+)['"]?\s+(?:is|was)\s+not valid for fields param/i);
+    if (singleMatch && singleMatch[1] && /^[A-Za-z0-9_]+$/.test(singleMatch[1])) {
+      seen.add(singleMatch[1]);
+    }
+  });
+
+  return Array.from(seen);
 }
 
 function ensureFields(fields, level) {
@@ -229,45 +262,69 @@ app.post("/api/insights", async (req, res) => {
       "video_2_sec_continuous_watch_actions",
       "video_3_sec_watched_actions",
     ]);
-    const requestedFields = body.fields.filter((f) => !invalid.has(f));
-    const fields = ensureFields(requestedFields, body.level);
+    let requestedFields = Array.from(new Set(body.fields.filter((f) => !invalid.has(f))));
+    let fields = ensureFields(requestedFields, body.level);
 
-    const commonParams = {
+    const baseParams = {
       level: body.level,
       time_increment: body.timeIncrement,
       limit: 5000,
-      fields: fields.join(","),
     };
 
-    if (body.useUnifiedAttribution) commonParams.use_unified_attribution_setting = true;
-    if (body.actionReportTime) commonParams.action_report_time = body.actionReportTime;
+    if (body.useUnifiedAttribution) baseParams.use_unified_attribution_setting = true;
+    if (body.actionReportTime) baseParams.action_report_time = body.actionReportTime;
     if (body.breakdowns && body.breakdowns.length) {
-      commonParams.breakdowns = body.breakdowns.join(",");
+      baseParams.breakdowns = body.breakdowns.join(",");
     }
 
     if (body.since && body.until) {
-      commonParams.time_range = JSON.stringify({ since: body.since, until: body.until });
+      baseParams.time_range = JSON.stringify({ since: body.since, until: body.until });
     } else if (body.datePreset) {
-      commonParams.date_preset = body.datePreset;
+      baseParams.date_preset = body.datePreset;
     } else {
-      commonParams.date_preset = "last_7d";
+      baseParams.date_preset = "last_7d";
     }
 
-    const rows = [];
-    for (const acc of body.accounts) {
-      let next = `${META_HOST}/${encodeURIComponent(body.apiVersion)}/${encodeURIComponent(acc)}/insights?${toQuery(commonParams)}`;
-      while (next) {
-        const payload = await metaFetch(next, token);
-        (payload.data || []).forEach((obj) => {
-          const flat = flattenInsight(obj);
-          addDerived(flat, body.resultActionType);
-          rows.push(flat);
-        });
-        next = payload.paging && payload.paging.next ? payload.paging.next : null;
+    const removedFields = new Set();
+
+    // Retry loop to automatically drop unsupported insight fields.
+    while (true) {
+      const params = { ...baseParams, fields: fields.join(",") };
+      const rows = [];
+      try {
+        for (const acc of body.accounts) {
+          let next = `${META_HOST}/${encodeURIComponent(body.apiVersion)}/${encodeURIComponent(acc)}/insights?${toQuery(params)}`;
+          while (next) {
+            const payload = await metaFetch(next, token);
+            (payload.data || []).forEach((obj) => {
+              const flat = flattenInsight(obj);
+              addDerived(flat, body.resultActionType);
+              rows.push(flat);
+            });
+            next = payload.paging && payload.paging.next ? payload.paging.next : null;
+          }
+        }
+
+        const response = { count: rows.length, rows };
+        if (removedFields.size) {
+          response.removedFields = Array.from(removedFields);
+        }
+        return res.json(response);
+      } catch (error) {
+        const invalidFields = extractInvalidInsightFields(error);
+        if (!invalidFields.length) throw error;
+        invalidFields.forEach((field) => removedFields.add(field));
+        const filteredRequested = requestedFields.filter((field) => !removedFields.has(field));
+        if (!filteredRequested.length) {
+          const message = `No valid fields remain after removing unsupported fields: ${Array.from(removedFields).join(", ")}`;
+          log.error({ invalidFields: Array.from(removedFields) }, message);
+          return res.status(400).json({ error: message });
+        }
+        requestedFields = filteredRequested;
+        fields = ensureFields(requestedFields, body.level);
+        log.warn({ invalidFields }, "Retrying insights fetch without unsupported fields");
       }
     }
-
-    res.json({ count: rows.length, rows });
   } catch (error) {
     log.error(error);
     res.status(400).json({ error: error.message || String(error) });

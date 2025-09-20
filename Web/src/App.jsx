@@ -1563,6 +1563,7 @@ export default function App() {
   const [sort, setSort] = useState({ key: "spend", dir: "desc" });
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
+  const autoRemovedFieldsRef = useRef([]);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [configLoaded, setConfigLoaded] = useState(false);
   const [draftToken, setDraftToken] = useState("");
@@ -1690,7 +1691,9 @@ export default function App() {
       return;
     }
     setIsLoading(true);
-    setError("");
+    if (!autoRemovedFieldsRef.current.length) {
+      setError("");
+    }
     try {
       const basePayload = {
         accounts: effectiveAccountIds,
@@ -1715,6 +1718,23 @@ export default function App() {
         fetchJson(`${API_BASE_URL}/api/insights`, { method: "POST", body: buildBody(breakdownPayload, { breakdowns: ["region"] }) }),
       ]);
 
+      const removedFields = Array.isArray(main?.removedFields)
+        ? main.removedFields.filter((field) => typeof field === "string" && field)
+        : [];
+      if (removedFields.length) {
+        const newFields = removedFields.filter((field) => !excludedInsightFields.includes(field));
+        if (newFields.length) {
+          autoRemovedFieldsRef.current = newFields;
+          setError(`Removed unsupported insight fields: ${newFields.join(", ")} (retrying...)`);
+          setExcludedInsightFields((prev) => {
+            const merged = new Set(prev);
+            newFields.forEach((field) => merged.add(field));
+            return Array.from(merged);
+          });
+          return;
+        }
+      }
+
       const normalized = (main.rows || []).map(normalizeMainRow);
       setDetailRows(normalized);
       setRawRows(aggregateByCampaign(normalized));
@@ -1723,6 +1743,12 @@ export default function App() {
       setGenderRows(normalizeBreakdownRows(gender.rows || [], "gender"));
       setRegionRows(normalizeBreakdownRows(region.rows || [], "region"));
       setLastUpdated(new Date().toISOString());
+      if (autoRemovedFieldsRef.current.length) {
+        setError(`Removed unsupported insight fields: ${autoRemovedFieldsRef.current.join(", ")}`);
+        autoRemovedFieldsRef.current = [];
+      } else {
+        setError("");
+      }
     } catch (e) {
       const message = e?.message || "Unable to load insights";
       const match = typeof message === "string" && message.match(/(?:field|parameter) ['"]?([A-Za-z0-9_]+)['"]?/i);
